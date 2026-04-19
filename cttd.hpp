@@ -4,10 +4,11 @@
 #include <cassert>
 #include <concepts>
 #include <cstdint>
+#include <initializer_list>
 #include <meta>
+#include <string_view>
 #include <type_traits>
 #include <utility>
-#include <vector>
 
 namespace cttd {
 
@@ -16,7 +17,13 @@ namespace detail {
 template <typename Base>
 struct invokers; // for no macro define derived type list
 
-}
+template <typename... Args> struct type_list; // NOTE: incomplete type is enough
+
+constexpr std::string_view type_list_name = "type_list";
+
+constexpr std::uint32_t npos = static_cast<std::uint32_t>(-1);
+
+} // namespace detail
 
 template <typename Base> struct enable_dispatch {
   std::uint32_t index = 0;
@@ -26,12 +33,11 @@ template <typename Base> struct enable_dispatch {
 template <typename Base, typename... Derived> consteval void define_invokers() {
   using namespace std::meta;
 
-  std::vector<info> members;
-  template for (constexpr auto derived : {^^Derived *...}) {
-    data_member_options options{.name = identifier_of(remove_pointer(derived))};
-    members.emplace_back(data_member_spec(derived, options));
-  }
-  define_aggregate(^^detail::invokers<Base>, members);
+  using plist_t = detail::type_list<Derived...> *;
+  data_member_options options{.name = detail::type_list_name};
+  auto type_list = data_member_spec(^^plist_t, options);
+  auto members = {type_list};
+  define_aggregate(^^detail::invokers<Base>, std::move(members));
 }
 
 // has public identifier
@@ -40,19 +46,37 @@ concept eligible_for_dispatch = std::derived_from<T, enable_dispatch<T>>;
 
 namespace detail {
 
+template <typename Invokers>
+[[nodiscard]] consteval std::meta::info type_list_of() {
+  using namespace std::meta;
+  auto context = access_context::unchecked();
+  for (auto member : nonstatic_data_members_of(^^Invokers, context)) {
+    if (has_identifier(member) &&
+        identifier_of(member) == detail::type_list_name) {
+      return remove_pointer(type_of(member));
+    }
+  }
+  return ^^void;
+}
+
 template <typename T, typename Invokers> struct position_of {
   static constexpr std::uint32_t value = [] consteval -> std::uint32_t {
     using namespace std::meta;
+    auto type_list = type_list_of<Invokers>();
+    if (is_same_type(^^void, type_list)) {
+      return npos;
+    }
 
+    auto types = template_arguments_of(type_list);
     std::uint32_t pos = 0;
-    auto context = access_context::unchecked();
-    for (auto member : nonstatic_data_members_of(^^Invokers, context)) {
-      if (is_same_type(^^T, remove_pointer(type_of(member)))) {
+    for (auto inf : types) {
+      if (is_same_type(remove_pointer(inf), ^^T)) {
         return pos;
       }
       ++pos;
     }
-    return static_cast<std::uint32_t>(-1);
+
+    return npos;
   }();
 };
 
@@ -62,10 +86,9 @@ template <typename T, typename Invokers> struct position_of {
 template <typename Base, typename Derived>
   requires eligible_for_dispatch<Base> && std::derived_from<Derived, Base>
 constexpr void set_invoker(Derived *self) noexcept {
-  constexpr auto pos =
-      detail::position_of<Derived, detail::invokers<Base>>::value;
-  static_assert(pos != static_cast<std::uint32_t>(-1),
-                "Derived is not present in invokers<Base>.");
+  using namespace detail;
+  constexpr auto pos = position_of<Derived, invokers<Base>>::value;
+  static_assert(pos != npos, "Derived is not present in invokers<Base>.");
   static_cast<enable_dispatch<Base> *>(self)->index = pos + 1;
 }
 
@@ -73,13 +96,14 @@ namespace detail {
 
 using namespace std::meta;
 
-template <typename Base> consteval auto invoker_members() {
-  return std::define_static_array(
-      nonstatic_data_members_of(^^invokers<Base>, access_context::unchecked()));
+template <typename Base> consteval auto invoker_list_of() {
+  auto list = type_list_of<invokers<Base>>();
+  return std::define_static_array(template_arguments_of(list));
 }
 
 template <typename Base> consteval std::uint32_t invoker_count() {
-  return static_cast<std::uint32_t>(invoker_members<Base>().size());
+  auto list = type_list_of<invokers<Base>>();
+  return static_cast<std::uint32_t>(template_arguments_of(list).size());
 }
 
 template <info Current> consteval info named_function_of() {
@@ -112,13 +136,10 @@ consteval info find_matching_member() {
   template for (constexpr auto member : members) {
     if constexpr (has_identifier(member)) {
       if constexpr (identifier_of(member) == current_name) {
-        if constexpr (has_parent(member) &&
-                      is_same_type(parent_of(member), ^^Derived)) {
-          if constexpr ((is_function(member) || is_function_template(member)) &&
-                        reflected_member_invocable<member, Derived, Ret,
-                                                   Args...>) {
-            return member;
-          }
+        if constexpr ((is_function(member) || is_function_template(member)) &&
+                      reflected_member_invocable<member, Derived, Ret,
+                                                 Args...>) {
+          return member;
         }
       }
     }
@@ -134,7 +155,7 @@ consteval auto make_dispatch_stub() {
   return +[](Base *self, Args... args) -> return_type {
     constexpr auto member =
         find_matching_member<CurrFn, Derived, return_type, Args...>();
-    static_assert(member != ^^void,
+    static_assert(!is_type(member),
                   "Did not find a matching derived dispatch target.");
 
     return static_cast<Derived *>(self)->[:member:](
@@ -151,7 +172,7 @@ consteval auto make_default_dispatch_stub() {
     constexpr auto member =
         find_matching_member<CurrFn, Derived, return_type, Args...>();
 
-    if constexpr (member != ^^void) {
+    if constexpr (!is_type(member)) {
       return static_cast<Derived *>(self)->[:member:](
           std::forward<Args>(args)...);
     } else {
@@ -168,10 +189,10 @@ consteval auto make_dispatch_table() {
   constexpr auto count = invoker_count<Base>();
   std::array<function_type, count> table{};
   std::size_t pos = 0;
-  static constexpr auto members = invoker_members<Base>();
+  static constexpr auto invokers = invoker_list_of<Base>();
 
-  template for (constexpr auto member : members) {
-    using derived_type = [:remove_pointer(type_of(member)):];
+  template for (constexpr auto invoker : invokers) {
+    using derived_type = [:invoker:];
     table[pos++] = make_dispatch_stub<CurrFn, Base, derived_type, Args...>();
   }
 
@@ -186,10 +207,10 @@ consteval auto make_default_dispatch_table() {
   constexpr auto count = invoker_count<Base>();
   std::array<function_type, count> table{};
   std::size_t pos = 0;
-  static constexpr auto members = invoker_members<Base>();
+  static constexpr auto invokers = invoker_list_of<Base>();
 
-  template for (constexpr auto member : members) {
-    using derived_type = [:remove_pointer(type_of(member)):];
+  template for (constexpr auto invoker : invokers) {
+    using derived_type = [:invoker:];
     table[pos++] = make_default_dispatch_stub<CurrFn, Default, Base,
                                               derived_type, Args...>();
   }
